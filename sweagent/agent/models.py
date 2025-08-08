@@ -40,6 +40,7 @@ from sweagent.tools.tools import ToolConfig
 from sweagent.types import History, HistoryItem
 from sweagent.utils.log import get_logger
 
+
 try:
     import readline  # noqa: F401
 except ImportError:
@@ -678,18 +679,43 @@ class LiteLLMModel(AbstractModel):
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
         try:
-            response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
-                model=self.config.name,
-                messages=messages,
-                # temperature=self.config.temperature if temperature is None else temperature,
-                # top_p=self.config.top_p,
-                api_version=self.config.api_version,
-                api_key=self.config.choose_api_key(),
-                fallbacks=self.config.fallbacks,
-                **completion_kwargs,
-                **extra_args,
-                n=n,
-            )
+            if self.config.name.startswith("capi-"):
+                # Import the capi API method
+                try:
+                    import sys
+                    from pathlib import Path
+                    sys.path.append(str(Path.home() / "1" / "cai"))
+                    from capi import query_capi
+                    CAPI_AVAILABLE = True
+                except ImportError:
+                    CAPI_AVAILABLE = False
+                    query_capi = None
+                # Use custom API implementation
+                if not CAPI_AVAILABLE:
+                    raise ModelConfigurationError(
+                        f"Model {self.config.name} requires capi.py module at ~/1/cai/capi.py, "
+                        "but it could not be imported. Please implement the capi.py module."
+                    )
+                # Call the custom query_capi function
+                response = query_capi(
+                    use_model=self.config.name.split("capi-",maxsplit=1)[1],
+                    messages=messages,
+                    temperature=self.config.temperature if temperature is None else temperature,
+                    max_tokens=self.model_max_output_tokens,
+                )
+            else:
+                response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
+                    model=self.config.name,
+                    messages=messages,
+                    # temperature=self.config.temperature if temperature is None else temperature,
+                    # top_p=self.config.top_p,
+                    api_version=self.config.api_version,
+                    api_key=self.config.choose_api_key(),
+                    fallbacks=self.config.fallbacks,
+                    **completion_kwargs,
+                    **extra_args,
+                    n=n,
+                )
         except litellm.exceptions.ContextWindowExceededError as e:
             raise ContextWindowExceededError from e
         except litellm.exceptions.ContentPolicyViolationError as e:
