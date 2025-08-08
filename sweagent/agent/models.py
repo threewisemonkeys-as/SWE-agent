@@ -702,6 +702,7 @@ class LiteLLMModel(AbstractModel):
                     messages=messages,
                     temperature=self.config.temperature if temperature is None else temperature,
                     max_tokens=self.model_max_output_tokens,
+                    tools= self.tools.tools if self.tools.use_function_calling else None
                 )
             else:
                 response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
