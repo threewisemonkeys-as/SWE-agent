@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 import json
 import os
 import random
+import re
 import shlex
+import subprocess
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from threading import Lock
@@ -14,6 +19,14 @@ from typing import Annotated, Any, Literal
 
 import litellm
 import litellm.types.utils
+from openai import AzureOpenAI, OpenAI, NOT_GIVEN
+import openai  # ← NEW: for exception classes
+from azure.identity import (
+    ChainedTokenCredential,
+    AzureCliCredential,
+    DefaultAzureCredential,
+    get_bearer_token_provider,
+)
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
 from swerex.exceptions import SwerexException
@@ -21,9 +34,11 @@ from tenacity import (
     RetryCallState,
     Retrying,
     retry_if_not_exception_type,
+    retry_if_exception_message,
     stop_after_attempt,
     wait_random_exponential,
 )
+from dotenv import load_dotenv
 
 from sweagent import REPO_ROOT
 from sweagent.exceptions import (
@@ -138,6 +153,11 @@ class GenericAPIModelConfig(PydanticBaseModel):
     Set this to 0 to disable this check.
     """
 
+    litellm_model_registry: str | None = None
+    """If set, this will override the default model registry for litellm.
+    Use this for local models or models not (yet) in the default litellm model registry for tracking costs.
+    """
+
     # pydantic
     model_config = ConfigDict(extra="forbid")
 
@@ -180,7 +200,14 @@ class GenericAPIModelConfig(PydanticBaseModel):
 
     @property
     def id(self) -> str:
-        return f"{self.name}__t-{self.temperature:.2f}__p-{self.top_p:.2f}__c-{self.per_instance_cost_limit:.2f}"
+        name = self.name.replace("/", "--")
+        if self.top_p is not None:
+            top_p = f"{self.top_p:.2f}"
+        else:
+            top_p = "None"
+        temperature = f"{self.temperature:.2f}"
+        per_instance_cost_limit = f"{self.per_instance_cost_limit:.2f}"
+        return f"{name}__t-{temperature}__p-{top_p}__c-{per_instance_cost_limit}"
 
 
 class ReplayModelConfig(GenericAPIModelConfig):
@@ -223,6 +250,8 @@ class HumanModelConfig(GenericAPIModelConfig):
     )
     total_cost_limit: float = Field(default=0.0, description="Cost limit for all instances (tasks).")
     cost_per_call: float = 0.0
+    catch_eof: bool = True
+    """Whether to catch EOF and return 'exit' when ^D is pressed. Set to False when used in human_step_in mode."""
     model_config = ConfigDict(extra="forbid")
 
 
@@ -240,12 +269,40 @@ class HumanThoughtModelConfig(HumanModelConfig):
     model_config = ConfigDict(extra="forbid")
 
 
+class CopilotClaudeModelConfig(GenericAPIModelConfig):
+    """Configuration for GitHub Copilot Claude API model"""
+
+    name: Literal["claude-sonnet-4"] = Field(default="claude-sonnet-4", description="Model name.")
+    
+    api_base: str | None = Field(
+        default="https://api.enterprise.githubcopilot.com",
+        description="GitHub Copilot API base URL"
+    )
+    api_version: str | None = Field(
+        default="2025-05-01",
+        description="GitHub Copilot API version"
+    )
+    
+    vscode_copilot_dir: str | None = Field(
+        default="~/repo/vscode-copilot",
+        description="Path to vscode-copilot directory. If not provided, will use VSCODE_COPILOT_DIR env var or ~/vscode-copilot"
+    )
+    
+    max_tokens: int = Field(
+        default=8192,
+        description="Maximum tokens for completion"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
 ModelConfig = Annotated[
     GenericAPIModelConfig
     | ReplayModelConfig
     | InstantEmptySubmitModelConfig
     | HumanModelConfig
-    | HumanThoughtModelConfig,
+    | HumanThoughtModelConfig
+    | CopilotClaudeModelConfig,
     Field(union_mode="left_to_right"),
 ]
 
@@ -387,8 +444,6 @@ class HumanModel(AbstractModel):
             while True:
                 action = input("... ")
                 if action.rstrip() == "end_multiline_command":
-                    return self._query(history, action_prompt)
-                if action.rstrip() == "end_multiline_command":
                     break
                 buffer.append(action)
             action = "\n".join(buffer)
@@ -414,8 +469,12 @@ class HumanModel(AbstractModel):
                 print("^C (exit with ^D)")
                 out.append(self.query(history, action_prompt))
             except EOFError:
-                print("\nGoodbye!")
-                out.append({"message": "exit"})
+                if self.config.catch_eof:
+                    print("\nGoodbye!")
+                    out.append({"message": "exit"})
+                else:
+                    # Re-raise EOFError when catch_eof is disabled
+                    raise
         if n is None:
             return out[0]
         return out
@@ -570,7 +629,10 @@ class LiteLLMModel(AbstractModel):
                     "See https://swe-agent.com/latest/faq/ for more information."
                 )
                 self.logger.warning(msg)
-
+        if self.config.litellm_model_registry is not None:
+            with open(self.config.litellm_model_registry) as f:
+                model_costs = json.load(f)
+                litellm.register_model(model_costs)
         if self.config.max_input_tokens is not None:
             self.model_max_input_tokens = self.config.max_input_tokens
         else:
@@ -681,8 +743,8 @@ class LiteLLMModel(AbstractModel):
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
                 messages=messages,
-                # temperature=self.config.temperature if temperature is None else temperature,
-                # top_p=self.config.top_p,
+                temperature=self.config.temperature if temperature is None else temperature,
+                top_p=self.config.top_p,
                 api_version=self.config.api_version,
                 api_key=self.config.choose_api_key(),
                 fallbacks=self.config.fallbacks,
@@ -698,7 +760,7 @@ class LiteLLMModel(AbstractModel):
             if "is longer than the model's context length" in str(e):
                 raise ContextWindowExceededError from e
             raise
-        self.logger.info(f"Response: {response}")
+        self.logger.debug(f"Response: {response}")
         try:
             cost = litellm.cost_calculator.completion_cost(response)
         except Exception as e:
@@ -775,6 +837,7 @@ class LiteLLMModel(AbstractModel):
                     litellm.exceptions.AuthenticationError,
                     ContentPolicyViolationError,
                     ModelConfigurationError,
+                    KeyboardInterrupt,
                 )
             ),
             before_sleep=retry_warning,
@@ -818,11 +881,423 @@ class LiteLLMModel(AbstractModel):
         return messages
 
 
+class AzureLLMModel(LiteLLMModel):
+    """
+    Azure implementation of LiteLLMModel.
+    Falls back on the Azure OpenAI SDK instead of `litellm.completion`.
+    """
+
+    # All deployments that are available via the public TRAPI endpoint
+    AZURE_SUPPORTED_MODELS = ["gpt-4o", "o3", "o3-mini", "o4-mini", "gpt-4.1", "gpt-4.5-preview", "o1", "gpt-4.1-mini"]
+
+    _MODEL_META: dict[str, tuple[str, str, str]] = {
+        #  name      -> (version,               instance,       api_version)
+        "gpt-4o":  ("2024-05-13", "gcr/preview", "2024-10-21"),
+        "o3":      ("2025-04-16", "msrne/shared", "2025-04-01-preview"),
+        "o3-mini": ("2025-01-31", "msrne/shared", "2025-04-01-preview"),
+        "o4-mini": ("2025-04-16", "msrne/shared", "2025-04-01-preview"),
+        "gpt-4.1": ("2025-04-14", "gcr/shared", "2025-04-01-preview"),
+        "gpt-4.5-preview": ("2025-02-27", "msrne/shared", "2025-04-01-preview"),
+        "o1": ("2024-12-17", "msrne/shared", "2025-04-01-preview"),
+        "gpt-4.1-mini": ("2025-04-14", "msrne/shared", "2025-04-01-preview"),
+    }
+
+    # Models that don't support custom temperature or top_p
+    NOT_TEMPERATURE_MODELS = ["o1", "o3", "o3-mini", "o4-mini"]
+
+    def __init__(self, args: GenericAPIModelConfig, tools: ToolConfig):
+        if args.name not in self.AZURE_SUPPORTED_MODELS:
+            msg = f"{args.name} not in supported Azure models {self.AZURE_SUPPORTED_MODELS}"
+            raise ValueError(msg)
+        super().__init__(args, tools)
+
+        version, instance, self._api_version = self._MODEL_META[self.config.name]
+        self._deployment_name = re.sub(r"[^a-zA-Z0-9._-]", "", f"{self.config.name}_{version}")
+        self._endpoint = f"https://trapi.research.microsoft.com/{instance}"
+
+        self._credential = get_bearer_token_provider(
+            ChainedTokenCredential(
+                AzureCliCredential(),
+                DefaultAzureCredential(
+                    exclude_cli_credential=True,
+                    exclude_environment_credential=True,
+                    exclude_shared_token_cache_credential=True,
+                    exclude_developer_cli_credential=True,
+                    exclude_powershell_credential=True,
+                    exclude_interactive_browser_credential=True,
+                    exclude_visual_studio_code_credentials=True,
+                    managed_identity_client_id=os.environ.get("DEFAULT_IDENTITY_CLIENT_ID"),
+                ),
+            ),
+            "api://trapi/.default",
+        )
+
+        self._azure_client = AzureOpenAI(
+            azure_endpoint=self._endpoint,
+            azure_ad_token_provider=self._credential,
+            api_version=self._api_version,
+        )
+
+    def _single_query(
+        self,
+        messages: list[dict[str, str]],
+        n: int | None = None,
+        temperature: float | None = None,
+    ) -> list[dict]:
+        self._sleep()
+
+        messages_no_cache_control = copy.deepcopy(messages)
+        for m in messages_no_cache_control:
+            if "cache_control" in m:
+                del m["cache_control"]
+
+        input_tokens = litellm.utils.token_counter(
+            messages=messages_no_cache_control,
+            model=self.config.name,
+        )
+        if self.model_max_input_tokens is None:
+            msg = (
+                f"No max input tokens found for model {self.config.name!r}. "
+                "If you are using a local model, you can set `max_input_token` in the model config to override this."
+            )
+            self.logger.warning(msg)
+        elif input_tokens > self.model_max_input_tokens > 0:
+            msg = f"Input tokens {input_tokens} exceed max tokens {self.model_max_input_tokens}"
+            raise ContextWindowExceededError(msg)
+
+        # Build Azure request arguments                                   #
+        azure_kwargs: dict[str, Any] = dict(
+            model=self._deployment_name,
+            messages=messages_no_cache_control,
+            n=n or 1,
+        )
+        
+        # Only set temperature and top_p for models that support them
+        if self.config.name not in self.NOT_TEMPERATURE_MODELS:
+            azure_kwargs["temperature"] = self.config.temperature if temperature is None else temperature
+            azure_kwargs["top_p"] = self.config.top_p
+        
+        if self.tools.use_function_calling:
+            azure_kwargs["tools"] = self.tools.tools
+
+        # Call Azure OpenAI & basic error handling                        #
+        try:
+            response = self._azure_client.chat.completions.create(**azure_kwargs)  # type: ignore
+        except openai.BadRequestError as e:
+            if "is longer than the model's context length" in str(e):
+                raise ContextWindowExceededError from e
+            raise
+        except openai.RateLimitError as e:
+            # Let this bubble up for retry handling
+            raise
+        except openai.OpenAIError:
+            raise
+
+        # Convert response → SWE-agent format                             #
+        outputs: list[dict] = []
+        for choice in response.choices:  # type: ignore[attr-defined]
+            out: dict[str, Any] = {"message": choice.message.content or ""}
+            if self.tools.use_function_calling and getattr(choice.message, "tool_calls", None):
+                out["tool_calls"] = [tc.model_dump() for tc in choice.message.tool_calls]  # type: ignore
+            outputs.append(out)
+
+        # Prefer server-reported token usage
+        if getattr(response, "usage", None) is not None and getattr(response.usage, "completion_tokens", None) is not None:
+            output_tokens = int(response.usage.completion_tokens or 0)
+        else:
+            # Fallback: approximate with litellm token counter
+            output_tokens = sum(
+                litellm.utils.token_counter(text=o["message"], model=self.config.name) for o in outputs
+            )
+
+        # NOTE: pricing for TRAPI models is unknown → record zero cost
+        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=0.0)
+        return outputs
+
+    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        messages = self._history_to_messages(history)
+
+        def retry_warning(retry_state: RetryCallState):
+            exception = retry_state.outcome.exception() if retry_state.outcome else None
+            if exception:
+                self.logger.warning(
+                    f"Retrying Azure query (attempt {retry_state.attempt_number}) due to {exception.__class__.__name__}: {exception}"
+                )
+
+        # Custom retry loop for Azure-specific errors
+        for attempt in Retrying(
+            stop=stop_after_attempt(self.config.retry.retries),
+            wait=wait_random_exponential(
+                min=self.config.retry.min_wait, max=self.config.retry.max_wait
+            ),
+            reraise=True,
+            retry=retry_if_not_exception_type((
+                ContextWindowExceededError,
+                CostLimitExceededError,
+                ModelConfigurationError,
+                openai.AuthenticationError,
+                openai.BadRequestError,  # retry on RateLimitError, but NOT on these
+                KeyboardInterrupt,
+            )),
+            before_sleep=retry_warning,
+        ):
+            with attempt:
+                outputs = self._single_query(messages, n=n, temperature=temperature)
+
+        return outputs if n > 1 else outputs[0]
+
+
+class CopilotClaudeModel(LiteLLMModel):
+    """
+    GitHub Copilot Claude API implementation.
+    Uses OpenAI client format but connects to GitHub Copilot Claude endpoints.
+    """
+
+    COPILOT_CLAUDE_SUPPORTED_MODELS = ["claude-sonnet-4"]
+
+    def __init__(self, args: CopilotClaudeModelConfig, tools: ToolConfig):
+        if args.name not in self.COPILOT_CLAUDE_SUPPORTED_MODELS:
+            msg = f"{args.name} not in supported Copilot Claude models {self.COPILOT_CLAUDE_SUPPORTED_MODELS}"
+            raise ValueError(msg)
+        super().__init__(args, tools)
+        
+        self.config: CopilotClaudeModelConfig = args
+        self._client = None
+        self._token_cache = None
+        self._token_expires_at = 0
+
+    def create_request_hmac(self, hmac_secret: str) -> str | None:
+        """Create HMAC for request authentication"""
+        if not hmac_secret:
+            return None
+        current = str(int(time.time()))
+        signature = hmac.new(
+            hmac_secret.encode("utf-8"), current.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return f"{current}.{signature}"
+
+    def fetch_token(self) -> str:
+        """Fetch GitHub Copilot token using Node.js script"""
+        # Cache token for 30 minutes to avoid frequent fetches
+        if self._token_cache and time.time() < self._token_expires_at:
+            return self._token_cache
+
+        try:
+            # Get the vscode-copilot directory path
+            vscode_copilot_dir = (
+                self.config.vscode_copilot_dir or 
+                os.environ.get("VSCODE_COPILOT_DIR", os.path.expanduser("~/repo/vscode-copilot"))
+            )
+            vscode_copilot_dir = os.path.expanduser(vscode_copilot_dir)
+            if not os.path.exists(vscode_copilot_dir):
+                raise ValueError(f"vscode-copilot directory not found at: {vscode_copilot_dir}. "
+                               "Set VSCODE_COPILOT_DIR environment variable or vscode_copilot_dir config to the correct path.")
+            
+            result = subprocess.run(
+                ["npx", "tsx", "src/util/node/fetch-token-standalone.js"],
+                capture_output=True,
+                text=True,
+                cwd=vscode_copilot_dir,  # Run from vscode-copilot directory
+            )
+            
+            if result.returncode != 0:
+                error_msg = f"Command failed with exit code {result.returncode}"
+                if result.stderr:
+                    error_msg += f"\nSTDERR: {result.stderr}"
+                if result.stdout:
+                    error_msg += f"\nSTDOUT: {result.stdout}"
+                raise ValueError(error_msg)
+            
+            token = result.stdout.strip()
+            if not token:
+                raise ValueError("fetch-token.js returned empty output")
+            
+            # Cache the token for 30 minutes
+            self._token_cache = token
+            self._token_expires_at = time.time() + 1800  # 30 minutes
+            return token
+        except Exception as e:
+            raise ValueError(f"Failed to get Copilot token: {e}")
+
+    @property
+    def client(self):
+        if self._client is None:
+            # Get the vscode-copilot directory path
+            vscode_copilot_dir = (
+                self.config.vscode_copilot_dir or 
+                os.environ.get("VSCODE_COPILOT_DIR", os.path.expanduser("~/repo/vscode-copilot"))
+            )
+            
+            env_file_path = os.path.expanduser(os.path.join(vscode_copilot_dir, ".env"))
+
+            # Try loading .env file if HMAC_SECRET not already set
+            if not os.environ.get("HMAC_SECRET") and os.path.exists(env_file_path):
+                try:
+                    load_dotenv(dotenv_path=env_file_path)
+                except Exception as e:
+                    self.logger.warning("Failed to load .env file: %s", e)
+
+            hmac_secret = os.environ.get("HMAC_SECRET")
+            if not hmac_secret:
+                raise ValueError(
+                    "HMAC_SECRET not found. Please set it in environment variables or in a .env file in the vscode-copilot directory."
+                )
+            
+            bearer_token = self.fetch_token()
+            hmac_value = self.create_request_hmac(hmac_secret)
+            
+            if not hmac_value or not bearer_token:
+                raise ValueError("Missing HMAC or Bearer token for GitHub Copilot Claude API")
+
+            # Create OpenAI client with GitHub Copilot endpoint and custom headers
+            self._client = OpenAI(
+                api_key=bearer_token,
+                base_url=self.config.api_base or "https://api.enterprise.githubcopilot.com",
+                default_headers={
+                    "X-Interaction-Type": "conversation-agent",
+                    "OpenAI-Intent": "conversation-agent",
+                    "X-GitHub-Api-Version": self.config.api_version or "2025-05-01",
+                    "Copilot-Integration-Id": "vscode-chat-dev",
+                    "VScode-SessionId": "sweagent-session",
+                    "VScode-MachineId": "sweagent-machine",
+                    "X-Interaction-Id": str(uuid.uuid4()),
+                    "X-Initiator": "agent",
+                    "Editor-Version": "sweagent/1.0",
+                    "Editor-Plugin-Version": "sweagent/1.0",
+                    "Request-Hmac": hmac_value,
+                },
+                timeout=None,
+            )
+        return self._client
+
+    def _single_query(
+        self,
+        messages: list[dict[str, str]],
+        n: int | None = None,
+        temperature: float | None = None,
+    ) -> list[dict]:
+        self._sleep()
+
+        messages_no_cache_control = copy.deepcopy(messages)
+        for m in messages_no_cache_control:
+            if "cache_control" in m:
+                del m["cache_control"]
+
+        input_tokens = litellm.utils.token_counter(
+            messages=messages_no_cache_control,
+            model=self.config.name,
+        )
+        if self.model_max_input_tokens is None:
+            msg = (
+                f"No max input tokens found for model {self.config.name!r}. "
+                "If you are using a local model, you can set `max_input_token` in the model config to override this."
+            )
+            self.logger.warning(msg)
+        elif input_tokens > self.model_max_input_tokens > 0:
+            msg = f"Input tokens {input_tokens} exceed max tokens {self.model_max_input_tokens}"
+            raise ContextWindowExceededError(msg)
+
+        # Build request arguments for GitHub Copilot Claude API
+        request_kwargs: dict[str, Any] = dict(
+            model=self.config.name,
+            messages=messages_no_cache_control,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature if temperature is None else temperature,
+        )
+        
+        if self.config.top_p is not None:
+            request_kwargs["top_p"] = self.config.top_p
+        
+        if self.tools.use_function_calling:
+            request_kwargs["tools"] = self.tools.tools
+            request_kwargs["tool_choice"] = "auto"
+
+        # Call GitHub Copilot Claude API
+        try:
+            response = self.client.chat.completions.create(**request_kwargs)
+        except openai.BadRequestError as e:
+            if e.code == "context_length_exceeded" or "is longer than the model's context length" in str(e):
+                raise ContextWindowExceededError from e
+            raise
+        except openai.RateLimitError as e:
+            # Let this bubble up for retry handling
+            raise
+        except openai.OpenAIError:
+            raise
+
+        # Convert response to SWE-agent format
+        outputs: list[dict] = []
+        combined_message = ""
+        combined_tool_calls = []
+        
+        for choice in response.choices:
+            if choice.message.content:
+                combined_message += choice.message.content
+            if self.tools.use_function_calling and getattr(choice.message, "tool_calls", None):
+                combined_tool_calls.extend([tc.model_dump() for tc in choice.message.tool_calls])
+        
+        # Create single output with combined message and tool calls
+        out: dict[str, Any] = {"message": combined_message}
+        if combined_tool_calls:
+            out["tool_calls"] = combined_tool_calls
+        outputs.append(out)
+
+        # Use server-reported token usage if available
+        if getattr(response, "usage", None) is not None and getattr(response.usage, "completion_tokens", None) is not None:
+            output_tokens = int(response.usage.completion_tokens or 0)
+        else:
+            # Fallback: approximate with litellm token counter
+            output_tokens = sum(
+                litellm.utils.token_counter(text=o["message"], model=self.config.name) for o in outputs
+            )
+
+        # NOTE: GitHub Copilot Claude API pricing may vary → record zero cost for now
+        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=0.0)
+        return outputs
+
+    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        messages = self._history_to_messages(history)
+
+        def retry_warning(retry_state: RetryCallState):
+            exception = retry_state.outcome.exception() if retry_state.outcome else None
+            if exception:
+                self.logger.warning(
+                    f"Retrying Copilot Claude query (attempt {retry_state.attempt_number}) due to {exception.__class__.__name__}: {exception}"
+                )
+            # Special handling for HMAC timestamp errors - clear client to force new token
+            if isinstance(exception, openai.AuthenticationError) and "HMAC timestamp out of range" in str(exception):
+                self.logger.info("Refreshing client due to HMAC timestamp error")
+                # self._client = None  # Clear client to force recreation with new HMAC
+
+        # Custom retry loop for Copilot Claude API-specific errors
+        for attempt in Retrying(
+            stop=stop_after_attempt(self.config.retry.retries),
+            wait=wait_random_exponential(
+                min=self.config.retry.min_wait, max=self.config.retry.max_wait
+            ),
+            reraise=True,
+            retry=retry_if_not_exception_type((
+                ContextWindowExceededError,
+                CostLimitExceededError,
+                ModelConfigurationError,
+                # Remove openai.AuthenticationError from here to allow retry for HMAC timestamp errors
+                openai.BadRequestError,
+                KeyboardInterrupt,
+            )) | retry_if_exception_message(match="HMAC timestamp out of range"),
+            before_sleep=retry_warning,
+        ):
+            with attempt:
+                outputs = self._single_query(messages, n=n, temperature=temperature)
+
+        # To update to merge message and tool calls into a single dict
+        return outputs if n > 1 else outputs[0]
+
+
 def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     """Returns correct model object given arguments and commands"""
     # Convert GenericAPIModelConfig to specific model config if needed
     if isinstance(args, GenericAPIModelConfig) and not isinstance(
-        args, HumanModelConfig | HumanThoughtModelConfig | ReplayModelConfig | InstantEmptySubmitModelConfig
+        args, HumanModelConfig | HumanThoughtModelConfig | ReplayModelConfig | InstantEmptySubmitModelConfig | CopilotClaudeModelConfig
     ):
         if args.name == "human":
             args = HumanModelConfig(**args.model_dump())
@@ -832,6 +1307,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
             args = ReplayModelConfig(**args.model_dump())
         elif args.name == "instant_empty_submit":
             args = InstantEmptySubmitModelConfig(**args.model_dump())
+        elif args.name in CopilotClaudeModel.COPILOT_CLAUDE_SUPPORTED_MODELS:
+            args = CopilotClaudeModelConfig(**args.model_dump())
 
     if args.name == "human":
         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"
@@ -845,5 +1322,11 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     elif args.name == "instant_empty_submit":
         assert isinstance(args, InstantEmptySubmitModelConfig), f"Expected {InstantEmptySubmitModelConfig}, got {args}"
         return InstantEmptySubmitTestModel(args, tools)
+    if isinstance(args, CopilotClaudeModelConfig):
+        return CopilotClaudeModel(args, tools)
+    if isinstance(args, GenericAPIModelConfig) and args.name in AzureLLMModel.AZURE_SUPPORTED_MODELS:
+        return AzureLLMModel(args, tools)
+    assert isinstance(args, GenericAPIModelConfig), f"Expected {GenericAPIModelConfig}, got {args}"
+    return LiteLLMModel(args, tools)
     assert isinstance(args, GenericAPIModelConfig), f"Expected {GenericAPIModelConfig}, got {args}"
     return LiteLLMModel(args, tools)
