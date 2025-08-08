@@ -559,6 +559,8 @@ class LiteLLMModel(AbstractModel):
         """Model served by the `litellm` library."""
         # Always copy config to avoid shared state between different instances
         self.config: GenericAPIModelConfig = args.model_copy(deep=True)
+        self.config.per_instance_cost_limit = 0.0 # hardcode this to skip cost limit checks
+        self.config.total_cost_limit = 0.0  # hardcode this to skip cost limit checks
         self.stats = InstanceStats()
         self.tools = tools
         self.logger = get_logger("swea-lm", emoji="🤖")
